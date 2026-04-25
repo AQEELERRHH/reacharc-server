@@ -306,7 +306,7 @@ app.post('/agent/launch', async (req, res) => {
     id: agentId, goal,
     budget: parseFloat(budget),
     maxPerBid: parseFloat(maxPerBid || 10),
-    minScore: parseInt(minScore || 6),
+    minScore: parseInt(minScore || 0),
     message: message || 'Hi, I am an autonomous agent on ReachArc.',
     status: 'running', spent: 0, bidsPlaced: 0, logs: [],
     startedAt: new Date().toISOString()
