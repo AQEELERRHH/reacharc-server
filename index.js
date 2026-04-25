@@ -121,11 +121,14 @@ app.get('/', (req, res) => {
     protocol: "x402",
     aiEngine: "Gemini 2.0 Flash",
     endpoints: {
-      listCreators: "GET /creators",
-      getCreator:   "GET /creator/:address",
-      sendMessage:  "POST /message/:address",
-      scoreMessage: "POST /score",
-      agentBid:     "POST /agent/bid"
+     "listCreators":"GET /creators",
+"getCreator":"GET /creator/:address",
+"sendMessage":"POST /message/:address",
+"scoreMessage":"POST /score",
+"launchAgent":"POST /agent/launch",
+"agentStatus":"GET /agent/status/:agentId",
+"stopAgent":"POST /agent/stop/:agentId",
+"voiceParse":"POST /voice-parse"
     }
   });
 });
@@ -341,7 +344,7 @@ Score 1-10 on goal match. Respond ONLY with valid JSON:
     const text = result.response.text().trim().replace(/\`\`\`json|\`\`\`/g, '').trim();
     return JSON.parse(text);
   } catch (e) {
-    return { score: 0, shouldBid: false, reason: 'Evaluation failed' };
+   return { score: 5, shouldBid: true, reason: 'Gemini unavailable - defaulting to bid' };
   }
 }
 
@@ -455,7 +458,7 @@ async function runCircleAgent(agentId) {
         const evaluation = await evaluateCreator({ name, bio, tags, minBidUSD: Number(minBid)/1e6 }, agent.goal);
         log('Gemini: ' + evaluation.score + '/10 — ' + evaluation.reason);
 
-        if (!evaluation.shouldBid || evaluation.score < agent.minScore) {
+       if (evaluation.score < agent.minScore && agent.minScore > 0) {
           log('Skipping ' + name, 'warn'); continue;
         }
 
