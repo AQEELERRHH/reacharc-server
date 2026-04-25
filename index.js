@@ -6,7 +6,7 @@
 
 require('dotenv').config();
 const express = require('express');
-const { ethers } = require('ethers');
+const { ethers } = require('ethers');const { initiateDeveloperControlledWalletsClient } = require('@circle-fin/developer-controlled-wallets');
 const cors = require('cors');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
@@ -292,6 +292,216 @@ app.post('/agent/bid', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+
+// ── CIRCLE WALLET AUTONOMOUS AGENT ───────────────────────────
+const { initiateDeveloperControlledWalletsClient } = require('@circle-fin/developer-controlled-wallets');
+const activeAgents = new Map();
+
+app.post('/agent/launch', async (req, res) => {
+  const { goal, budget, maxPerBid, minScore, message } = req.body;
+  if (!goal || !budget) return res.status(400).json({ error: 'goal and budget required' });
+  const agentId = 'agent_' + Date.now();
+  activeAgents.set(agentId, {
+    id: agentId, goal,
+    budget: parseFloat(budget),
+    maxPerBid: parseFloat(maxPerBid || 10),
+    minScore: parseInt(minScore || 6),
+    message: message || 'Hi, I am an autonomous agent on ReachArc.',
+    status: 'running', spent: 0, bidsPlaced: 0, logs: [],
+    startedAt: new Date().toISOString()
+  });
+  res.json({ agentId, status: 'launched' });
+  runCircleAgent(agentId).catch(e => {
+    const agent = activeAgents.get(agentId);
+    if (agent) { agent.status = 'error'; agent.logs.push({ time: new Date().toISOString(), msg: e.message, type: 'err' }); }
+  });
+});
+
+app.get('/agent/status/:agentId', (req, res) => {
+  const agent = activeAgents.get(req.params.agentId);
+  if (!agent) return res.status(404).json({ error: 'Agent not found' });
+  res.json(agent);
+});
+
+app.post('/agent/stop/:agentId', (req, res) => {
+  const agent = activeAgents.get(req.params.agentId);
+  if (!agent) return res.status(404).json({ error: 'Agent not found' });
+  agent.status = 'stopped';
+  res.json({ agentId: req.params.agentId, status: 'stopped' });
+});
+
+async function evaluateCreator(creator, goal) {
+  try {
+    const prompt = `You are an autonomous bidder agent on ReachArc.
+Goal: "${goal}"
+Creator: Name: ${creator.name}, Bio: ${creator.bio}, Tags: ${creator.tags}, Min bid: $${creator.minBidUSD}
+Score 1-10 on goal match. Respond ONLY with valid JSON:
+{"score":7,"reason":"Brief reason","recommendedBidUSD":5,"shouldBid":true}`;
+    const result = await gemini.generateContent(prompt);
+    const text = result.response.text().trim().replace(/\`\`\`json|\`\`\`/g, '').trim();
+    return JSON.parse(text);
+  } catch (e) {
+    return { score: 0, shouldBid: false, reason: 'Evaluation failed' };
+  }
+}
+
+async function runCircleAgent(agentId) {
+  const agent = activeAgents.get(agentId);
+  const log = (msg, type = '') => {
+    console.log(`[Agent ${agentId}] ${msg}`);
+    agent.logs.push({ time: new Date().toISOString(), msg, type });
+    if (agent.logs.length > 100) agent.logs.shift();
+  };
+
+  log('Circle Wallet Agent initialized', 'ok');
+  log('Wallet: ' + (process.env.CIRCLE_AGENT_ADDRESS || 'not configured'), 'ok');
+  log('Goal: ' + agent.goal);
+  log('Budget: $' + agent.budget + ' USDC');
+
+  const arcProvider = new ethers.JsonRpcProvider(process.env.ARC_RPC);
+  const readContract = new ethers.Contract(process.env.CONTRACT_ADDRESS, CONTRACT_ABI, arcProvider);
+
+  let circleClient = null;
+  if (process.env.CIRCLE_API_KEY && process.env.CIRCLE_ENTITY_SECRET) {
+    try {
+      circleClient = initiateDeveloperControlledWalletsClient({
+        apiKey: process.env.CIRCLE_API_KEY,
+        entitySecret: process.env.CIRCLE_ENTITY_SECRET,
+      });
+      log('Circle client initialized', 'ok');
+
+      const balRes = await circleClient.getWalletTokenBalance({ id: process.env.CIRCLE_WALLET_ID });
+      const balances = balRes.data?.tokenBalances || [];
+      const usdcBal = balances.find(b => b.token?.symbol?.includes('USDC'));
+      const bal = usdcBal ? parseFloat(usdcBal.amount) : 0;
+      log('Circle USDC balance: $' + bal.toFixed(2), bal > 0 ? 'ok' : 'warn');
+      if (bal === 0) log('Fund wallet at faucet.circle.com → Arc Testnet: ' + process.env.CIRCLE_AGENT_ADDRESS, 'warn');
+    } catch (e) {
+      log('Circle init error: ' + e.message, 'warn');
+      log('Falling back to env wallet', 'warn');
+      circleClient = null;
+    }
+  } else {
+    log('Circle not configured — using env wallet', 'warn');
+  }
+
+  const fallbackWallet = process.env.PRIVATE_KEY
+    ? new ethers.Wallet(process.env.PRIVATE_KEY, arcProvider)
+    : null;
+
+  async function circleTransaction(contractAddress, abiFragment, params) {
+    const iface = new ethers.Interface([abiFragment]);
+    const fnName = abiFragment.match(/function (\w+)/)[1];
+    const calldata = iface.encodeFunctionData(fnName, params);
+    const txRes = await circleClient.createContractExecutionTransaction({
+      walletId: process.env.CIRCLE_WALLET_ID,
+      contractAddress,
+      calldata,
+      fee: { type: 'level', config: { feeLevel: 'MEDIUM' } },
+    });
+    const txId = txRes.data?.id;
+    if (!txId) throw new Error('No tx ID from Circle');
+    const terminal = new Set(['COMPLETE', 'FAILED', 'CANCELLED', 'DENIED']);
+    let state = txRes.data?.state;
+    let attempts = 0;
+    while (!terminal.has(state) && attempts < 30) {
+      await new Promise(r => setTimeout(r, 3000));
+      const poll = await circleClient.getTransaction({ id: txId });
+      state = poll.data?.transaction?.state;
+      const hash = poll.data?.transaction?.txHash;
+      attempts++;
+      if (hash) { log('Tx: ' + hash, 'ok'); return hash; }
+    }
+    if (state !== 'COMPLETE') throw new Error('Tx ended in state: ' + state);
+    return null;
+  }
+
+  async function fallbackTransaction(contractAddress, abiFragment, params) {
+    if (!fallbackWallet) throw new Error('No wallet configured');
+    const iface = new ethers.Interface([abiFragment]);
+    const fnName = abiFragment.match(/function (\w+)/)[1];
+    const writeContract = new ethers.Contract(contractAddress, [abiFragment], fallbackWallet);
+    const tx = await writeContract[fnName](...params);
+    const receipt = await tx.wait();
+    log('Tx: ' + receipt.hash, 'ok');
+    return receipt.hash;
+  }
+
+  async function sendTransaction(contractAddress, abiFragment, params) {
+    if (circleClient && process.env.CIRCLE_WALLET_ID) {
+      return await circleTransaction(contractAddress, abiFragment, params);
+    } else {
+      return await fallbackTransaction(contractAddress, abiFragment, params);
+    }
+  }
+
+  const biddedAddresses = new Set();
+
+  while (agent.status === 'running' && agent.spent < agent.budget) {
+    log('Scanning creator registry on Arc...');
+    try {
+      const addresses = await readContract.getAllCreators();
+      log('Found ' + addresses.length + ' creator(s)', 'ok');
+
+      for (const addr of addresses) {
+        if (agent.status !== 'running') break;
+        if (biddedAddresses.has(addr.toLowerCase())) continue;
+        if (agent.spent >= agent.budget) break;
+
+        const [minBid, exists,, name, bio, tags] = await readContract.getCreator(addr);
+        if (!exists) continue;
+
+        log('Evaluating: ' + name);
+        const evaluation = await evaluateCreator({ name, bio, tags, minBidUSD: Number(minBid)/1e6 }, agent.goal);
+        log('Gemini: ' + evaluation.score + '/10 — ' + evaluation.reason);
+
+        if (!evaluation.shouldBid || evaluation.score < agent.minScore) {
+          log('Skipping ' + name, 'warn'); continue;
+        }
+
+        const bidAmount = Math.floor(Math.min(
+          Math.max((evaluation.recommendedBidUSD || agent.maxPerBid) * 1e6, Number(minBid)),
+          agent.maxPerBid * 1e6,
+          (agent.budget - agent.spent) * 1e6
+        ));
+
+        if (bidAmount < Number(minBid)) { log('Insufficient budget for ' + name, 'warn'); continue; }
+
+        log('Bidding $' + (bidAmount/1e6).toFixed(2) + ' on ' + name + '...');
+        try {
+          log('Approving USDC...');
+          await sendTransaction(
+            process.env.USDC_ADDRESS,
+            'function approve(address spender, uint256 amount) external returns (bool)',
+            [process.env.CONTRACT_ADDRESS, bidAmount]
+          );
+          log('Placing bid...');
+          await sendTransaction(
+            process.env.CONTRACT_ADDRESS,
+            'function placeBid(address creator, uint256 amount, string message, bool isPrivate, bytes32 x402TxHash) external',
+            [addr, bidAmount, agent.message, false, ethers.ZeroHash]
+          );
+          biddedAddresses.add(addr.toLowerCase());
+          agent.spent += bidAmount / 1e6;
+          agent.bidsPlaced++;
+          log('✓ Bid placed on ' + name + '! Spent: $' + agent.spent.toFixed(2), 'ok');
+        } catch (e) {
+          log('Bid failed: ' + (e.reason || e.message), 'err');
+        }
+        await new Promise(r => setTimeout(r, 4000));
+      }
+    } catch (e) {
+      log('Scan error: ' + e.message, 'err');
+    }
+    if (agent.status === 'running') {
+      log('Next scan in 60 seconds...');
+      await new Promise(r => setTimeout(r, 60000));
+    }
+  }
+  agent.status = agent.spent >= agent.budget ? 'budget_exhausted' : 'stopped';
+  log('Done. Spent: $' + agent.spent.toFixed(2) + ' · Bids: ' + agent.bidsPlaced, 'ok');
+}
 
 // ── VOICE PARSE ENDPOINT ──────────────────────────────────────
 app.post('/voice-parse', async (req, res) => {
