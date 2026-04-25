@@ -293,6 +293,43 @@ app.post('/agent/bid', async (req, res) => {
   }
 });
 
+// ── VOICE PARSE ENDPOINT ──────────────────────────────────────
+app.post('/voice-parse', async (req, res) => {
+  const { transcript } = req.body;
+  if (!transcript) return res.status(400).json({ error: 'No transcript' });
+
+  try {
+    const prompt = `You are a voice command parser for ReachArc, an agentic attention marketplace on Arc blockchain.
+
+The user said: "${transcript}"
+
+Parse this into a structured command. Possible actions:
+- LAUNCH_AGENT: user wants to find creators and bid on them
+- DISCOVER_CREATORS: user wants to browse creators
+- REGISTER_CREATOR: user wants to register as a creator
+
+Extract budget, maxPerBid, goal from their words.
+
+Respond ONLY with valid JSON, no markdown:
+{"action":"LAUNCH_AGENT","goal":"find web3 developers on Arc","budget":20,"maxPerBid":5,"minScore":6,"confidence":"high"}`;
+
+    const result = await gemini.generateContent(prompt);
+    const text = result.response.text().trim().replace(/\`\`\`json|\`\`\`/g, '').trim();
+    const intent = JSON.parse(text);
+    res.json({ intent });
+  } catch (e) {
+    res.json({
+      intent: {
+        action: 'LAUNCH_AGENT',
+        goal: transcript,
+        budget: 20,
+        maxPerBid: 5,
+        minScore: 6,
+        confidence: 'low'
+      }
+    });
+  }
+});
 // ── START ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
