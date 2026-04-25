@@ -295,7 +295,6 @@ app.post('/agent/bid', async (req, res) => {
 
 
 // ── CIRCLE WALLET AUTONOMOUS AGENT ───────────────────────────
-const { initiateDeveloperControlledWalletsClient } = require('@circle-fin/developer-controlled-wallets');
 const activeAgents = new Map();
 
 app.post('/agent/launch', async (req, res) => {
